@@ -15,6 +15,12 @@ license {
     header = project.rootProject.file('HEADER.txt')
 }
 
+sourceSets {
+    ap {
+        compileClasspath += main.compileClasspath + main.output
+    }
+}
+
 jar {
     manifest {
         def buildNumber = System.getenv("BUILD_NUMBER") ?: "unknown"
