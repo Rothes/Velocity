@@ -73,7 +73,7 @@ shadowJar {
 }
 
 artifacts {
-    archives javadocJar
+    // archives javadocJar
     archives shadowJar
     archives sourcesJar
 }
