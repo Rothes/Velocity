@@ -7,6 +7,7 @@ plugins {
 
 apply plugin: 'org.cadixdev.licenser'
 apply from: '../gradle/checkstyle.gradle'
+apply from: '../gradle/publish.gradle'
 apply plugin: 'com.github.johnrengelman.shadow'
 
 license {
