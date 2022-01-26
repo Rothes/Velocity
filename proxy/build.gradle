@@ -92,6 +92,12 @@ dependencies {
     testImplementation "org.mockito:mockito-core:3.+"
 }
 
+task sourcesJar(type: Jar) {
+    classifier 'sources'
+    from sourceSets.main.allSource
+    from sourceSets.ap.output
+}
+
 test {
     useJUnitPlatform()
 }
