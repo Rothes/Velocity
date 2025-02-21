@@ -18,6 +18,9 @@ tasks {
     }
 
     jar {
+        withSourcesJar()
+        withJavadocJar()
+
         manifest {
             attributes["Implementation-Title"] = "Velocity"
             attributes["Implementation-Vendor"] = "Velocity Contributors"
