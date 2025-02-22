@@ -12,15 +12,17 @@ application {
     applicationDefaultJvmArgs += listOf("-Dvelocity.packet-decode-logging=true");
 }
 
+java {
+    withJavadocJar()
+    withSourcesJar()
+}
+
 tasks {
     withType<Checkstyle> {
         exclude("**/com/velocitypowered/proxy/protocol/packet/**")
     }
 
     jar {
-        withSourcesJar()
-        withJavadocJar()
-
         manifest {
             attributes["Implementation-Title"] = "Velocity"
             attributes["Implementation-Vendor"] = "Velocity Contributors"
