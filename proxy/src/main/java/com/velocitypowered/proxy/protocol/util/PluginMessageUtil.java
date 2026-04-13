@@ -22,13 +22,20 @@ import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.collect.ImmutableList;
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
+import com.velocitypowered.api.proxy.messages.LegacyChannelIdentifier;
+import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.util.ProxyVersion;
+import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
+import com.velocitypowered.proxy.util.except.QuietDecoderException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
@@ -85,13 +92,18 @@ public final class PluginMessageUtil {
         .equals(UNREGISTER_CHANNEL);
   }
 
+  private static final QuietDecoderException ILLEGAL_CHANNEL = new QuietDecoderException("Illegal channel");
+
   /**
    * Fetches all the channels in a register or unregister plugin message.
    *
+   * @param existingChannels the number of channels already registered
    * @param message the message to get the channels from
    * @return the channels, as an immutable list
    */
-  public static List<String> getChannels(PluginMessagePacket message) {
+  public static List<ChannelIdentifier> getChannels(int existingChannels,
+                                                    PluginMessagePacket message,
+                                                    ProtocolVersion protocolVersion) {
     checkNotNull(message, "message");
     checkArgument(isRegister(message) || isUnregister(message), "Unknown channel type %s",
         message.getChannel());
@@ -100,8 +112,28 @@ public final class PluginMessageUtil {
       // has caused issues with 1.13+ compatibility. Just return an empty list.
       return ImmutableList.of();
     }
-    String channels = message.content().toString(StandardCharsets.UTF_8);
-    return ImmutableList.copyOf(channels.split("\0"));
+    String payload = message.content().toString(StandardCharsets.UTF_8);
+    checkArgument(payload.length() <= Short.MAX_VALUE, "payload too long: %s", payload.length());
+    String[] channels = payload.split("\0");
+    checkArgument(existingChannels + channels.length <= ConnectedPlayer.MAX_CLIENTSIDE_PLUGIN_CHANNELS,
+        "too many channels: %s + %s > %s", existingChannels, channels.length, ConnectedPlayer.MAX_CLIENTSIDE_PLUGIN_CHANNELS);
+    ImmutableList.Builder<ChannelIdentifier> channelIdentifiers = ImmutableList.builderWithExpectedSize(channels.length);
+    try {
+      for (String channel : channels) {
+        if (protocolVersion.noLessThan(ProtocolVersion.MINECRAFT_1_13)) {
+          channelIdentifiers.add(MinecraftChannelIdentifier.from(channel));
+        } else {
+          channelIdentifiers.add(new LegacyChannelIdentifier(channel));
+        }
+      }
+    } catch (IllegalArgumentException e) {
+      if (MinecraftDecoder.DEBUG) {
+        throw e;
+      } else {
+        throw ILLEGAL_CHANNEL;
+      }
+    }
+    return channelIdentifiers.build();
   }
 
   /**
@@ -112,14 +144,29 @@ public final class PluginMessageUtil {
    * @return the plugin message to send
    */
   public static PluginMessagePacket constructChannelsPacket(ProtocolVersion protocolVersion,
-                                                            Collection<String> channels) {
+                                                            Collection<ChannelIdentifier> channels) {
     checkNotNull(channels, "channels");
     checkArgument(!channels.isEmpty(), "no channels specified");
     String channelName = protocolVersion.noLessThan(ProtocolVersion.MINECRAFT_1_13)
         ? REGISTER_CHANNEL : REGISTER_CHANNEL_LEGACY;
     ByteBuf contents = Unpooled.buffer();
-    contents.writeCharSequence(String.join("\0", channels), StandardCharsets.UTF_8);
+    contents.writeCharSequence(joinChannels(channels), StandardCharsets.UTF_8);
     return new PluginMessagePacket(channelName, contents);
+  }
+
+  private static String joinChannels(Collection<ChannelIdentifier> channels) {
+    checkNotNull(channels, "channels");
+    checkArgument(!channels.isEmpty(), "no channels specified");
+    StringBuilder sb = new StringBuilder();
+    Iterator<ChannelIdentifier> iterator = channels.iterator();
+    while (iterator.hasNext()) {
+      ChannelIdentifier channel = iterator.next();
+      sb.append(channel.getId());
+      if (iterator.hasNext()) {
+        sb.append('\0');
+      }
+    }
+    return sb.toString();
   }
 
   /**
@@ -183,23 +230,20 @@ public final class PluginMessageUtil {
     }
 
     // Before falling into the fallback, explicitly rewrite certain messages.
-    switch (name) {
-      case REGISTER_CHANNEL_LEGACY:
-        return REGISTER_CHANNEL;
-      case UNREGISTER_CHANNEL_LEGACY:
-        return UNREGISTER_CHANNEL;
-      case BRAND_CHANNEL_LEGACY:
-        return BRAND_CHANNEL;
-      case "BungeeCord":
-        // This is a special historical case we are compelled to support for the benefit of
-        // BungeeQuack.
-        return "bungeecord:main";
-      default:
+    return switch (name) {
+      case REGISTER_CHANNEL_LEGACY -> REGISTER_CHANNEL;
+      case UNREGISTER_CHANNEL_LEGACY -> UNREGISTER_CHANNEL;
+      case BRAND_CHANNEL_LEGACY -> BRAND_CHANNEL;
+      // This is a special historical case we are compelled to support for the benefit of
+      // BungeeQuack.
+      case "BungeeCord" -> "bungeecord:main";
+      default -> {
         // This is very likely a legacy name, so transform it. Velocity uses the same scheme as
         // BungeeCord does to transform channels, but also removes clearly invalid characters as
         // well.
-        String lower = name.toLowerCase(Locale.ROOT);
-        return "legacy:" + INVALID_IDENTIFIER_REGEX.matcher(lower).replaceAll("");
-    }
+        final String lower = name.toLowerCase(Locale.ROOT);
+        yield "legacy:" + INVALID_IDENTIFIER_REGEX.matcher(lower).replaceAll("");
+      }
+    };
   }
 }

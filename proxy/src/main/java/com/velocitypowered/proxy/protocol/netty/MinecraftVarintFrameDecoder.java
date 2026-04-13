@@ -19,21 +19,57 @@ package com.velocitypowered.proxy.protocol.netty;
 
 import static io.netty.util.ByteProcessor.FIND_NON_NUL;
 
+import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.network.limiter.PacketLimiter;
+import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.util.except.QuietDecoderException;
+import com.velocitypowered.proxy.util.except.QuietRuntimeException;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.CorruptedFrameException;
 import java.util.List;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Frames Minecraft server packets which are prefixed by a 21-bit VarInt encoding.
  */
 public class MinecraftVarintFrameDecoder extends ByteToMessageDecoder {
 
+  private static final Logger LOGGER = LogManager.getLogger(MinecraftVarintFrameDecoder.class);
+  private static final QuietRuntimeException FRAME_DECODER_FAILED =
+      new QuietRuntimeException("A packet frame decoder failed. For more information, launch "
+          + "Velocity with -Dvelocity.packet-decode-logging=true to see more.");
   private static final QuietDecoderException BAD_PACKET_LENGTH =
       new QuietDecoderException("Bad packet length");
+  private static final QuietDecoderException INVALID_PREAMBLE =
+          new QuietDecoderException("Invalid packet preamble");
   private static final QuietDecoderException VARINT_TOO_BIG =
       new QuietDecoderException("VarInt too big");
+  private static final QuietDecoderException UNKNOWN_PACKET =
+      new QuietDecoderException("Unknown packet");
+
+  private final ProtocolUtils.Direction direction;
+  private final StateRegistry.PacketRegistry.ProtocolRegistry registry;
+  private StateRegistry state;
+  @Nullable
+  private PacketLimiter packetLimiter;
+
+  /**
+   * Creates a new {@code MinecraftVarintFrameDecoder} decoding packets from the specified {@code Direction}.
+   *
+   * @param direction the direction from which we decode from
+   */
+  public MinecraftVarintFrameDecoder(ProtocolUtils.Direction direction) {
+    this.direction = direction;
+    this.registry = StateRegistry.HANDSHAKE.getProtocolRegistry(
+        direction, ProtocolVersion.MINIMUM_VERSION);
+    this.state = StateRegistry.HANDSHAKE;
+  }
 
   @Override
   protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out)
@@ -44,32 +80,103 @@ public class MinecraftVarintFrameDecoder extends ByteToMessageDecoder {
     }
 
     // skip any runs of 0x00 we might find
+    int wlen = in.readableBytes();
     int packetStart = in.forEachByte(FIND_NON_NUL);
     if (packetStart == -1) {
       in.clear();
+      // Apply a more strict check in serverbound direction, we really shouldn't be seeing this many 0x00s
+      // even from the server, the only reason we even allow these is due to bugged servers
+      if (direction == ProtocolUtils.Direction.SERVERBOUND && wlen > 16) {
+        throw INVALID_PREAMBLE;
+      }
       return;
     }
     in.readerIndex(packetStart);
 
     // try to read the length of the packet
-    in.markReaderIndex();
-    int preIndex = in.readerIndex();
-    int length = readRawVarInt21(in);
-    if (preIndex == in.readerIndex()) {
-      return;
+    try {
+      int length = readRawVarInt21(in);
+      if (packetStart == in.readerIndex()) {
+        return;
+      }
+      if (length < 0) {
+        throw BAD_PACKET_LENGTH;
+      }
+
+      if (length > 0) {
+        if (state == StateRegistry.HANDSHAKE && direction == ProtocolUtils.Direction.SERVERBOUND) {
+          if (validateServerboundHandshakePacket(in, length)) {
+            in.readerIndex(packetStart);
+            return;
+          }
+        }
+      }
+
+      // note that zero-length packets are ignored
+      if (length > 0) {
+        if (in.readableBytes() < length) {
+          in.readerIndex(packetStart);
+        } else {
+          // If enabled, rate-limit serverbound payload bytes based on frame length
+          if (packetLimiter != null) {
+            if (!packetLimiter.account(length)) {
+              throw new QuietDecoderException(
+                      "Rate limit exceeded while processing packets for %s".formatted(
+                              ctx.channel().remoteAddress()));
+            }
+          }
+          out.add(in.readRetainedSlice(length));
+        }
+      }
+    } catch (Exception e) {
+      // Reset buffer to consistent state before propagating exception to prevent memory leaks
+      in.readerIndex(packetStart);
+      throw e;
     }
-    if (length < 0) {
-      throw BAD_PACKET_LENGTH;
+  }
+
+  private boolean validateServerboundHandshakePacket(ByteBuf in, int length) throws Exception {
+    StateRegistry.PacketRegistry.ProtocolRegistry registry =
+        state.getProtocolRegistry(direction, ProtocolVersion.MINIMUM_VERSION);
+
+    final int index = in.readerIndex();
+    final int packetId = readRawVarInt21(in);
+    // Index hasn't changed, we've read nothing
+    if (index == in.readerIndex()) {
+      return true;
+    }
+    final int payloadLength = length - ProtocolUtils.varIntBytes(packetId);
+
+    MinecraftPacket packet = registry.createPacket(packetId);
+
+    // We handle every packet in this phase, if you said something we don't know, something is really wrong
+    if (packet == null) {
+      throw UNKNOWN_PACKET;
     }
 
-    // note that zero-length packets are ignored
-    if (length > 0) {
-      if (in.readableBytes() < length) {
-        in.resetReaderIndex();
-      } else {
-        out.add(in.readRetainedSlice(length));
-      }
+    // We 'technically' have the incoming bytes of a payload here, and so, these can actually parse
+    // the packet if needed, so, we'll take advantage of the existing methods
+    int expectedMinLen = packet.decodeExpectedMinLength(in, direction, registry.version);
+    int expectedMaxLen = packet.decodeExpectedMaxLength(in, direction, registry.version);
+    if (expectedMaxLen != -1 && payloadLength > expectedMaxLen) {
+      throw handleOverflow(packet, expectedMaxLen, in.readableBytes());
     }
+    if (payloadLength < expectedMinLen) {
+      throw handleUnderflow(packet, expectedMaxLen, in.readableBytes());
+    }
+
+    in.readerIndex(index);
+    return false;
+  }
+
+  @Override
+  public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+    if (MinecraftDecoder.DEBUG) {
+      LOGGER.atWarn()
+          .withThrowable(cause)
+          .log("Exception caught while decoding frame for {}", ctx.channel().remoteAddress());
+    }
+    super.exceptionCaught(ctx, cause);
   }
 
   /**
@@ -140,5 +247,31 @@ public class MinecraftVarintFrameDecoder extends ByteToMessageDecoder {
       return result | tmp << 14;
     }
     return result | (tmp & 0x7F) << 14;
+  }
+
+  private Exception handleOverflow(MinecraftPacket packet, int expected, int actual) {
+    if (MinecraftDecoder.DEBUG) {
+      return new CorruptedFrameException("Packet sent for " + packet.getClass() + " was too "
+          + "big (expected " + expected + " bytes, got " + actual + " bytes)");
+    } else {
+      return FRAME_DECODER_FAILED;
+    }
+  }
+
+  private Exception handleUnderflow(MinecraftPacket packet, int expected, int actual) {
+    if (MinecraftDecoder.DEBUG) {
+      return new CorruptedFrameException("Packet sent for " + packet.getClass() + " was too "
+          + "small (expected " + expected + " bytes, got " + actual + " bytes)");
+    } else {
+      return FRAME_DECODER_FAILED;
+    }
+  }
+
+  public void setState(StateRegistry stateRegistry) {
+    this.state = stateRegistry;
+  }
+
+  public void setPacketLimiter(@Nullable PacketLimiter packetLimiter) {
+    this.packetLimiter = packetLimiter;
   }
 }

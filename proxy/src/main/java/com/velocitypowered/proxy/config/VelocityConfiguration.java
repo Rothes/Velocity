@@ -29,6 +29,7 @@ import com.velocitypowered.api.util.Favicon;
 import com.velocitypowered.proxy.config.migration.ConfigurationMigration;
 import com.velocitypowered.proxy.config.migration.ForwardingMigration;
 import com.velocitypowered.proxy.config.migration.KeyAuthenticationMigration;
+import com.velocitypowered.proxy.config.migration.MiniMessageTranslationsMigration;
 import com.velocitypowered.proxy.config.migration.MotdMigration;
 import com.velocitypowered.proxy.config.migration.TransferIntegrationMigration;
 import com.velocitypowered.proxy.util.AddressUtil;
@@ -78,6 +79,8 @@ public class VelocityConfiguration implements ProxyConfig {
   private boolean onlineModeKickExistingPlayers = false;
   @Expose
   private PingPassthroughMode pingPassthrough = PingPassthroughMode.DISABLED;
+  @Expose
+  private boolean samplePlayersInPing = false;
   private final Servers servers;
   private final ForcedHosts forcedHosts;
   @Expose
@@ -91,6 +94,8 @@ public class VelocityConfiguration implements ProxyConfig {
   private @Nullable Favicon favicon;
   @Expose
   private boolean forceKeyAuthentication = true; // Added in 1.19
+  @Expose
+  private PacketLimiterConfig packetLimiterConfig = PacketLimiterConfig.DEFAULT;
 
   private VelocityConfiguration(Servers servers, ForcedHosts forcedHosts, Advanced advanced,
       Query query, Metrics metrics) {
@@ -105,8 +110,9 @@ public class VelocityConfiguration implements ProxyConfig {
       boolean preventClientProxyConnections, boolean announceForge,
       PlayerInfoForwarding playerInfoForwardingMode, byte[] forwardingSecret,
       boolean onlineModeKickExistingPlayers, PingPassthroughMode pingPassthrough,
-      boolean enablePlayerAddressLogging, Servers servers, ForcedHosts forcedHosts,
-      Advanced advanced, Query query, Metrics metrics, boolean forceKeyAuthentication) {
+      boolean samplePlayersInPing, boolean enablePlayerAddressLogging, Servers servers,
+      ForcedHosts forcedHosts, Advanced advanced, Query query, Metrics metrics,
+      boolean forceKeyAuthentication, PacketLimiterConfig packetLimiterConfig) {
     this.bind = bind;
     this.motd = motd;
     this.showMaxPlayers = showMaxPlayers;
@@ -117,6 +123,7 @@ public class VelocityConfiguration implements ProxyConfig {
     this.forwardingSecret = forwardingSecret;
     this.onlineModeKickExistingPlayers = onlineModeKickExistingPlayers;
     this.pingPassthrough = pingPassthrough;
+    this.samplePlayersInPing = samplePlayersInPing;
     this.enablePlayerAddressLogging = enablePlayerAddressLogging;
     this.servers = servers;
     this.forcedHosts = forcedHosts;
@@ -124,6 +131,7 @@ public class VelocityConfiguration implements ProxyConfig {
     this.query = query;
     this.metrics = metrics;
     this.forceKeyAuthentication = forceKeyAuthentication;
+    this.packetLimiterConfig = packetLimiterConfig;
   }
 
   /**
@@ -152,19 +160,16 @@ public class VelocityConfiguration implements ProxyConfig {
     }
 
     switch (playerInfoForwardingMode) {
-      case NONE:
-        logger.warn("Player info forwarding is disabled! All players will appear to be connecting "
+      case NONE -> logger.warn("Player info forwarding is disabled! All players will appear to be connecting "
             + "from the proxy and will have offline-mode UUIDs.");
-        break;
-      case MODERN:
-      case BUNGEEGUARD:
+      case MODERN, BUNGEEGUARD -> {
         if (forwardingSecret == null || forwardingSecret.length == 0) {
           logger.error("You don't have a forwarding secret set. This is required for security.");
           valid = false;
         }
-        break;
-      default:
-        break;
+      }
+      default -> {
+      }
     }
 
     if (servers.getServers().isEmpty()) {
@@ -227,6 +232,11 @@ public class VelocityConfiguration implements ProxyConfig {
 
     if (advanced.loginRatelimit < 0) {
       logger.error("Invalid login ratelimit {}ms", advanced.loginRatelimit);
+      valid = false;
+    }
+
+    if (advanced.commandRateLimit < 0) {
+      logger.error("Invalid command rate limit {}", advanced.commandRateLimit);
       valid = false;
     }
 
@@ -351,6 +361,31 @@ public class VelocityConfiguration implements ProxyConfig {
     return advanced.getReadTimeout();
   }
 
+  @Override
+  public int getCommandRatelimit() {
+    return advanced.getCommandRateLimit();
+  }
+
+  @Override
+  public int getTabCompleteRatelimit() {
+    return advanced.getTabCompleteRateLimit();
+  }
+
+  @Override
+  public int getKickAfterRateLimitedTabCompletes() {
+    return advanced.getKickAfterRateLimitedTabCompletes();
+  }
+
+  @Override
+  public boolean isForwardCommandsIfRateLimited() {
+    return advanced.isForwardCommandsIfRateLimited();
+  }
+
+  @Override
+  public int getKickAfterRateLimitedCommands() {
+    return advanced.getKickAfterRateLimitedCommands();
+  }
+
   public boolean isProxyProtocol() {
     return advanced.isProxyProtocol();
   }
@@ -369,6 +404,10 @@ public class VelocityConfiguration implements ProxyConfig {
 
   public PingPassthroughMode getPingPassthrough() {
     return pingPassthrough;
+  }
+
+  public boolean getSamplePlayersInPing() {
+    return samplePlayersInPing;
   }
 
   public boolean isPlayerAddressLoggingEnabled() {
@@ -407,6 +446,14 @@ public class VelocityConfiguration implements ProxyConfig {
     return forceKeyAuthentication;
   }
 
+  public boolean isEnableReusePort() {
+    return advanced.isEnableReusePort();
+  }
+
+  public PacketLimiterConfig getPacketLimiterConfig() {
+    return packetLimiterConfig;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -424,6 +471,7 @@ public class VelocityConfiguration implements ProxyConfig {
         .add("favicon", favicon)
         .add("enablePlayerAddressLogging", enablePlayerAddressLogging)
         .add("forceKeyAuthentication", forceKeyAuthentication)
+        .add("packetLimiterConfig", packetLimiterConfig)
         .toString();
   }
 
@@ -462,6 +510,7 @@ public class VelocityConfiguration implements ProxyConfig {
           new ForwardingMigration(),
           new KeyAuthenticationMigration(),
           new MotdMigration(),
+          new MiniMessageTranslationsMigration(),
           new TransferIntegrationMigration()
       };
 
@@ -473,7 +522,7 @@ public class VelocityConfiguration implements ProxyConfig {
 
       String forwardingSecretString = System.getenv().getOrDefault(
               "VELOCITY_FORWARDING_SECRET", "");
-      if (forwardingSecretString.isEmpty()) {
+      if (forwardingSecretString.isBlank()) {
         final String forwardSecretFile = config.get("forwarding-secret-file");
         final Path secretPath = forwardSecretFile == null
                 ? defaultForwardingSecretPath
@@ -486,7 +535,11 @@ public class VelocityConfiguration implements ProxyConfig {
                     "The file " + forwardSecretFile + " is not a valid file or it is a directory.");
           }
         } else {
-          throw new RuntimeException("The forwarding-secret-file does not exist.");
+          Files.createFile(secretPath);
+          Files.writeString(secretPath, forwardingSecretString = generateRandomString(12),
+              StandardCharsets.UTF_8);
+          logger.info("The forwarding-secret-file does not exist. A new file has been created at {}",
+              forwardSecretFile);
         }
       }
       final byte[] forwardingSecret = forwardingSecretString.getBytes(StandardCharsets.UTF_8);
@@ -503,6 +556,8 @@ public class VelocityConfiguration implements ProxyConfig {
       final PingPassthroughMode pingPassthroughMode = config.getEnumOrElse("ping-passthrough",
               PingPassthroughMode.DISABLED);
 
+      final boolean samplePlayersInPing = config.getOrElse("sample-players-in-ping", false);
+
       final String bind = config.getOrElse("bind", "0.0.0.0:25565");
       final int maxPlayers = config.getIntOrElse("show-max-players", 500);
       final boolean onlineMode = config.getOrElse("online-mode", true);
@@ -513,6 +568,7 @@ public class VelocityConfiguration implements ProxyConfig {
       final boolean kickExisting = config.getOrElse("kick-existing-players", false);
       final boolean enablePlayerAddressLogging = config.getOrElse(
               "enable-player-address-logging", true);
+      final PacketLimiterConfig packetLimiterConfig = PacketLimiterConfig.fromConfig(config.get("packet-limiter"));
 
       // Throw an exception if the forwarding-secret file is empty and the proxy is using a
       // forwarding mode that requires it.
@@ -533,13 +589,15 @@ public class VelocityConfiguration implements ProxyConfig {
               forwardingSecret,
               kickExisting,
               pingPassthroughMode,
+              samplePlayersInPing,
               enablePlayerAddressLogging,
               new Servers(serversConfig),
               new ForcedHosts(forcedHostsConfig),
               new Advanced(advancedConfig),
               new Query(queryConfig),
               new Metrics(metricsConfig),
-              forceKeyAuthentication
+              forceKeyAuthentication,
+              packetLimiterConfig
       );
     }
   }
@@ -716,6 +774,18 @@ public class VelocityConfiguration implements ProxyConfig {
     private boolean logPlayerConnections = true;
     @Expose
     private boolean acceptTransfers = false;
+    @Expose
+    private boolean enableReusePort = false;
+    @Expose
+    private int commandRateLimit = 50;
+    @Expose
+    private boolean forwardCommandsIfRateLimited = true;
+    @Expose
+    private int kickAfterRateLimitedCommands = 5;
+    @Expose
+    private int tabCompleteRateLimit = 50;
+    @Expose
+    private int kickAfterRateLimitedTabCompletes = 10;
 
     private Advanced() {
     }
@@ -741,6 +811,12 @@ public class VelocityConfiguration implements ProxyConfig {
         this.logCommandExecutions = config.getOrElse("log-command-executions", false);
         this.logPlayerConnections = config.getOrElse("log-player-connections", true);
         this.acceptTransfers = config.getOrElse("accepts-transfers", false);
+        this.enableReusePort = config.getOrElse("enable-reuse-port", false);
+        this.commandRateLimit = config.getIntOrElse("command-rate-limit", 25);
+        this.forwardCommandsIfRateLimited = config.getOrElse("forward-commands-if-rate-limited", true);
+        this.kickAfterRateLimitedCommands = config.getIntOrElse("kick-after-rate-limited-commands", 0);
+        this.tabCompleteRateLimit = config.getIntOrElse("tab-complete-rate-limit", 10); // very lenient
+        this.kickAfterRateLimitedTabCompletes = config.getIntOrElse("kick-after-rate-limited-tab-completes", 0);
       }
     }
 
@@ -804,6 +880,30 @@ public class VelocityConfiguration implements ProxyConfig {
       return this.acceptTransfers;
     }
 
+    public boolean isEnableReusePort() {
+      return enableReusePort;
+    }
+
+    public int getCommandRateLimit() {
+      return commandRateLimit;
+    }
+
+    public boolean isForwardCommandsIfRateLimited() {
+      return forwardCommandsIfRateLimited;
+    }
+
+    public int getKickAfterRateLimitedCommands() {
+      return kickAfterRateLimitedCommands;
+    }
+
+    public int getTabCompleteRateLimit() {
+      return tabCompleteRateLimit;
+    }
+
+    public int getKickAfterRateLimitedTabCompletes() {
+      return kickAfterRateLimitedTabCompletes;
+    }
+
     @Override
     public String toString() {
       return "Advanced{"
@@ -821,6 +921,7 @@ public class VelocityConfiguration implements ProxyConfig {
           + ", logCommandExecutions=" + logCommandExecutions
           + ", logPlayerConnections=" + logPlayerConnections
           + ", acceptTransfers=" + acceptTransfers
+          + ", enableReusePort=" + enableReusePort
           + '}';
     }
   }
@@ -897,6 +998,35 @@ public class VelocityConfiguration implements ProxyConfig {
 
     public boolean isEnabled() {
       return enabled;
+    }
+  }
+
+  /**
+   * Configuration for packet limiting.
+   *
+   * @param interval the interval in seconds to measure packets over
+   * @param pps      the maximum number of packets per second allowed
+   * @param bytes    the maximum number of bytes per second allowed
+   */
+  public record PacketLimiterConfig(int interval, int pps, int bytes) {
+    public static PacketLimiterConfig DEFAULT = new PacketLimiterConfig(7, 500, -1);
+
+    /**
+     * returns a PacketLimiterConfig from a config section, or the default if the section is null.
+     *
+     * @param config the configuration object to parse
+     * @return the packet limiter config, or the default if {@code config} is null
+     */
+    public static PacketLimiterConfig fromConfig(CommentedConfig config) {
+      if (config != null) {
+        return new PacketLimiterConfig(
+            config.getIntOrElse("interval", DEFAULT.interval()),
+            config.getIntOrElse("packets-per-second", DEFAULT.pps()),
+            config.getIntOrElse("bytes-per-second", DEFAULT.bytes())
+        );
+      } else {
+        return DEFAULT;
+      }
     }
   }
 }

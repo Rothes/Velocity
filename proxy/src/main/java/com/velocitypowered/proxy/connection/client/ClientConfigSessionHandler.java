@@ -33,6 +33,7 @@ import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResp
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
+import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftEncoder;
 import com.velocitypowered.proxy.protocol.packet.ClientSettingsPacket;
 import com.velocitypowered.proxy.protocol.packet.KeepAlivePacket;
@@ -40,6 +41,8 @@ import com.velocitypowered.proxy.protocol.packet.PingIdentifyPacket;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundCustomClickActionPacket;
+import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductAcceptPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.KnownPacksPacket;
 import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
@@ -58,6 +61,8 @@ import org.apache.logging.log4j.Logger;
  * Handles the client config stage.
  */
 public class ClientConfigSessionHandler implements MinecraftSessionHandler {
+  private static final boolean BACKPRESSURE_LOG =
+      Boolean.getBoolean("velocity.log-server-backpressure");
 
   private static final Logger logger = LogManager.getLogger(ClientConfigSessionHandler.class);
   private final VelocityServer server;
@@ -134,7 +139,7 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
       ChannelIdentifier id = this.server.getChannelRegistrar().getFromId(packet.getChannel());
 
       if (id == null) {
-        serverConn.getPlayer().getConnection().write(packet.retain());
+        serverConn.ensureConnected().write(packet.retain());
         return true;
       }
 
@@ -170,7 +175,11 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(KnownPacksPacket packet) {
     callConfigurationEvent().thenRun(() -> {
-      player.getConnectionInFlightOrConnectedServer().ensureConnected().write(packet);
+      VelocityServerConnection targetServer =
+          player.getConnectionInFlightOrConnectedServer();
+      if (targetServer != null) {
+        targetServer.ensureConnected().write(packet);
+      }
     }).exceptionally(ex -> {
       logger.error("Error forwarding known packs response to backend:", ex);
       return null;
@@ -199,6 +208,26 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
         }, player.getConnection().eventLoop());
 
     return true;
+  }
+
+  @Override
+  public boolean handle(ServerboundCustomClickActionPacket packet) {
+    if (player.getConnectionInFlight() != null) {
+      player.getConnectionInFlight().ensureConnected().write(packet.retain());
+      return true;
+    }
+
+    return false;
+  }
+
+  @Override
+  public boolean handle(CodeOfConductAcceptPacket packet) {
+    if (this.player.getConnectionInFlight() != null) {
+      this.player.getConnectionInFlight().ensureConnected().write(packet);
+      return true;
+    }
+
+    return false;
   }
 
   @Override
@@ -240,6 +269,36 @@ public class ClientConfigSessionHandler implements MinecraftSessionHandler {
   @Override
   public void exception(Throwable throwable) {
     player.disconnect(Component.translatable("velocity.error.player-connection-error", NamedTextColor.RED));
+    if (MinecraftDecoder.DEBUG) {
+      logger.info("Exception while handling plugin message packet for {}", player, throwable);
+    }
+  }
+
+  @Override
+  public void writabilityChanged() {
+    final boolean writable = player.getConnection().getChannel().isWritable();
+
+    if (BACKPRESSURE_LOG) {
+      if (writable) {
+        logger.info("{} is writable, will auto-read backend connection data", player);
+      } else {
+        logger.info("{} is not writable, not auto-reading backend connection data", player);
+      }
+    }
+
+    if (!writable) {
+      // Flush pending packets to free up memory. Schedule on a future event loop invocation
+      // to avoid disabling auto-read while the flush resolves backpressure.
+      player.getConnection().eventLoop().execute(() -> player.getConnection().flush());
+    }
+
+    final VelocityServerConnection serverConn = player.getConnectionInFlightOrConnectedServer();
+    if (serverConn != null) {
+      final MinecraftConnection smc = serverConn.getConnection();
+      if (smc != null) {
+        smc.setAutoReading(writable);
+      }
+    }
   }
 
   /**

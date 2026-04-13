@@ -23,12 +23,15 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.ProtocolUtils.Direction;
 import com.velocitypowered.proxy.protocol.util.DeferredByteBufHolder;
 import io.netty.buffer.ByteBuf;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 public class PluginMessagePacket extends DeferredByteBufHolder implements MinecraftPacket {
+
+  private static final int MAX_PAYLOAD_SIZE = Integer.getInteger("velocity.max-plugin-message-payload-size", 32767);
 
   private @Nullable String channel;
 
@@ -100,6 +103,16 @@ public class PluginMessagePacket extends DeferredByteBufHolder implements Minecr
   }
 
   @Override
+  public int decodeExpectedMaxLength(ByteBuf buf, Direction direction, ProtocolVersion version) {
+    return ProtocolUtils.DEFAULT_MAX_STRING_BYTES + MAX_PAYLOAD_SIZE;
+  }
+
+  @Override
+  public int decodeExpectedMinLength(ByteBuf buf, Direction direction, ProtocolVersion version) {
+    return 1 + 0 + 0;
+  }
+
+  @Override
   public boolean handle(MinecraftSessionHandler handler) {
     return handler.handle(this);
   }
@@ -142,5 +155,10 @@ public class PluginMessagePacket extends DeferredByteBufHolder implements Minecr
   @Override
   public PluginMessagePacket touch(Object hint) {
     return (PluginMessagePacket) super.touch(hint);
+  }
+
+  @Override
+  public int encodeSizeHint(Direction direction, ProtocolVersion version) {
+    return content().readableBytes();
   }
 }

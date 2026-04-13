@@ -40,6 +40,7 @@ import com.velocitypowered.proxy.connection.util.ConnectionRequestResults.Impl;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
+import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
 import com.velocitypowered.proxy.protocol.packet.ClientboundCookieRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.ClientboundStoreCookiePacket;
 import com.velocitypowered.proxy.protocol.packet.DisconnectPacket;
@@ -51,6 +52,7 @@ import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TransferPacket;
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundCustomReportDetailsPacket;
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundServerLinksPacket;
+import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.RegistrySyncPacket;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
@@ -58,7 +60,7 @@ import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
 import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
-import java.io.IOException;
+import io.netty.channel.Channel;
 import java.net.InetSocketAddress;
 import java.util.concurrent.CompletableFuture;
 import net.kyori.adventure.key.Key;
@@ -70,6 +72,9 @@ import org.apache.logging.log4j.Logger;
  * 1.20.2+ switching. Yes, some of this is exceptionally stupid.
  */
 public class ConfigSessionHandler implements MinecraftSessionHandler {
+  private static final boolean BACKPRESSURE_LOG =
+      Boolean.getBoolean("velocity.log-server-backpressure");
+
   private static final Logger logger = LogManager.getLogger(ConfigSessionHandler.class);
   private final VelocityServer server;
   private final VelocityServerConnection serverConn;
@@ -232,6 +237,7 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
     final ConnectedPlayer player = serverConn.getPlayer();
     final ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
 
+    smc.getChannel().pipeline().get(MinecraftVarintFrameDecoder.class).setState(StateRegistry.PLAY);
     smc.getChannel().pipeline().get(MinecraftDecoder.class).setState(StateRegistry.PLAY);
     //noinspection DataFlowIssue
     configHandler.handleBackendFinishUpdate(serverConn).thenRunAsync(() -> {
@@ -254,7 +260,13 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(DisconnectPacket packet) {
     serverConn.disconnect();
-    resultFuture.complete(ConnectionRequestResults.forDisconnect(packet, serverConn.getServer()));
+    // If the player receives a DisconnectPacket without a connection to a server in progress,
+    // it means that the backend server has kicked the player during reconfiguration
+    if (serverConn.getPlayer().getConnectionInFlight() != null) {
+      resultFuture.complete(ConnectionRequestResults.forDisconnect(packet, serverConn.getServer()));
+    } else {
+      serverConn.getPlayer().handleConnectionException(serverConn.getServer(), packet, true);
+    }
     return true;
   }
 
@@ -357,14 +369,36 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   }
 
   @Override
+  public boolean handle(CodeOfConductPacket packet) {
+    this.serverConn.getPlayer().getConnection().write(packet.retain());
+    return true;
+  }
+
+  @Override
   public void disconnected() {
-    resultFuture.completeExceptionally(
-        new IOException("Unexpectedly disconnected from remote server"));
+    resultFuture.complete(ConnectionRequestResults.forDisconnect(
+        ConnectionMessages.INTERNAL_SERVER_CONNECTION_ERROR, serverConn.getServer()));
   }
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
     serverConn.getPlayer().getConnection().write(packet);
+  }
+
+  @Override
+  public void writabilityChanged() {
+    Channel serverChan = serverConn.ensureConnected().getChannel();
+    boolean writable = serverChan.isWritable();
+
+    if (BACKPRESSURE_LOG) {
+      if (writable) {
+        logger.info("{} is writable, will auto-read player connection data", this.serverConn);
+      } else {
+        logger.info("{} is not writable, not auto-reading player connection data", this.serverConn);
+      }
+    }
+
+    serverConn.getPlayer().getConnection().setAutoReading(writable);
   }
 
   private void switchFailure(Throwable cause) {

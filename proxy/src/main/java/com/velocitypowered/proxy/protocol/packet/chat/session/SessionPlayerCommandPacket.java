@@ -41,11 +41,12 @@ public class SessionPlayerCommandPacket implements MinecraftPacket {
 
   @Override
   public void decode(ByteBuf buf, ProtocolUtils.Direction direction, ProtocolVersion protocolVersion) {
-    this.command = ProtocolUtils.readString(buf, 256);
+    int cap = protocolVersion.lessThan(ProtocolVersion.MINECRAFT_1_20_5) ? 256 : ProtocolUtils.DEFAULT_MAX_STRING_SIZE;
+    this.command = ProtocolUtils.readString(buf, cap);
     this.timeStamp = Instant.ofEpochMilli(buf.readLong());
     this.salt = buf.readLong();
     this.argumentSignatures = new ArgumentSignatures(buf);
-    this.lastSeenMessages = new LastSeenMessages(buf);
+    this.lastSeenMessages = new LastSeenMessages(buf, protocolVersion);
   }
 
   @Override
@@ -54,7 +55,7 @@ public class SessionPlayerCommandPacket implements MinecraftPacket {
     buf.writeLong(this.timeStamp.toEpochMilli());
     buf.writeLong(this.salt);
     this.argumentSignatures.encode(buf);
-    this.lastSeenMessages.encode(buf);
+    this.lastSeenMessages.encode(buf, protocolVersion);
   }
 
   public String getCommand() {

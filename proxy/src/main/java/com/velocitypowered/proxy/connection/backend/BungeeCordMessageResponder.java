@@ -20,6 +20,7 @@ package com.velocitypowered.proxy.connection.backend;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ServerConnection;
+import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.LegacyChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
@@ -316,9 +317,9 @@ public class BungeeCordMessageResponder {
     });
   }
 
-  static String getBungeeCordChannel(ProtocolVersion version) {
-    return version.noLessThan(ProtocolVersion.MINECRAFT_1_13) ? MODERN_CHANNEL.getId()
-        : LEGACY_CHANNEL.getId();
+  static ChannelIdentifier getBungeeCordChannel(ProtocolVersion version) {
+    return version.noLessThan(ProtocolVersion.MINECRAFT_1_13) ? MODERN_CHANNEL
+        : LEGACY_CHANNEL;
   }
 
   // Note: this method will always release the buffer!
@@ -329,8 +330,8 @@ public class BungeeCordMessageResponder {
   // Note: this method will always release the buffer!
   private static void sendServerResponse(ConnectedPlayer player, ByteBuf buf) {
     MinecraftConnection serverConnection = player.ensureAndGetCurrentServer().ensureConnected();
-    String chan = getBungeeCordChannel(serverConnection.getProtocolVersion());
-    PluginMessagePacket msg = new PluginMessagePacket(chan, buf);
+    ChannelIdentifier chan = getBungeeCordChannel(serverConnection.getProtocolVersion());
+    PluginMessagePacket msg = new PluginMessagePacket(chan.getId(), buf);
     serverConnection.write(msg);
   }
 
@@ -343,66 +344,30 @@ public class BungeeCordMessageResponder {
       return false;
     }
 
-    ByteBufDataInput in = new ByteBufDataInput(message.content());
-    String subChannel = in.readUTF();
+    final ByteBufDataInput in = new ByteBufDataInput(message.content());
+    final String subChannel = in.readUTF();
     switch (subChannel) {
-      case "GetPlayerServer":
-        this.processGetPlayerServer(in);
-        break;
-      case "ForwardToPlayer":
-        this.processForwardToPlayer(in);
-        break;
-      case "Forward":
-        this.processForwardToServer(in);
-        break;
-      case "Connect":
-        this.processConnect(in);
-        break;
-      case "ConnectOther":
-        this.processConnectOther(in);
-        break;
-      case "IP":
-        this.processIp(in);
-        break;
-      case "PlayerCount":
-        this.processPlayerCount(in);
-        break;
-      case "PlayerList":
-        this.processPlayerList(in);
-        break;
-      case "GetServers":
-        this.processGetServers();
-        break;
-      case "Message":
-        this.processMessage(in);
-        break;
-      case "MessageRaw":
-        this.processMessageRaw(in);
-        break;
-      case "GetServer":
-        this.processGetServer();
-        break;
-      case "UUID":
-        this.processUuid();
-        break;
-      case "UUIDOther":
-        this.processUuidOther(in);
-        break;
-      case "IPOther":
-        this.processIpOther(in);
-        break;
-      case "ServerIP":
-        this.processServerIp(in);
-        break;
-      case "KickPlayer":
-        this.processKick(in);
-        break;
-      case "KickPlayerRaw":
-        this.processKickRaw(in);
-        break;
-      default:
-        // Do nothing, unknown command
-        break;
+      case "GetPlayerServer" -> this.processGetPlayerServer(in);
+      case "ForwardToPlayer" -> this.processForwardToPlayer(in);
+      case "Forward" -> this.processForwardToServer(in);
+      case "Connect" -> this.processConnect(in);
+      case "ConnectOther" -> this.processConnectOther(in);
+      case "IP" -> this.processIp(in);
+      case "PlayerCount" -> this.processPlayerCount(in);
+      case "PlayerList" -> this.processPlayerList(in);
+      case "GetServers" -> this.processGetServers();
+      case "Message" -> this.processMessage(in);
+      case "MessageRaw" -> this.processMessageRaw(in);
+      case "GetServer" -> this.processGetServer();
+      case "UUID" -> this.processUuid();
+      case "UUIDOther" -> this.processUuidOther(in);
+      case "IPOther" -> this.processIpOther(in);
+      case "ServerIP" -> this.processServerIp(in);
+      case "KickPlayer" -> this.processKick(in);
+      case "KickPlayerRaw" -> this.processKickRaw(in);
+      default -> {
+          // Do nothing, unknown command
+      }
     }
 
     return true;

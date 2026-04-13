@@ -25,7 +25,6 @@ import com.mojang.brigadier.builder.ArgumentBuilder;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
-import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
@@ -45,17 +44,19 @@ import io.netty.buffer.ByteBuf;
 import it.unimi.dsi.fastutil.objects.Object2IntLinkedOpenCustomHashMap;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import java.util.ArrayDeque;
-import java.util.Arrays;
 import java.util.Deque;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Predicate;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 public class AvailableCommandsPacket implements MinecraftPacket {
 
   private static final Command<CommandSource> PLACEHOLDER_COMMAND = source -> 0;
+  private static final Predicate<CommandSource> PLACEHOLDER_REQUIREMENT = source -> true;
 
   private static final byte NODE_TYPE_ROOT = 0x00;
   private static final byte NODE_TYPE_LITERAL = 0x01;
@@ -65,6 +66,7 @@ public class AvailableCommandsPacket implements MinecraftPacket {
   private static final byte FLAG_EXECUTABLE = 0x04;
   private static final byte FLAG_IS_REDIRECT = 0x08;
   private static final byte FLAG_HAS_SUGGESTIONS = 0x10;
+  private static final byte FLAG_IS_RESTRICTED = 0x20;
 
   private @MonotonicNonNull RootCommandNode<CommandSource> rootNode;
 
@@ -83,14 +85,14 @@ public class AvailableCommandsPacket implements MinecraftPacket {
   @Override
   public void decode(ByteBuf buf, Direction direction, ProtocolVersion protocolVersion) {
     int commands = ProtocolUtils.readVarInt(buf);
-    WireNode[] wireNodes = new WireNode[commands];
+    List<WireNode> wireNodes = ProtocolUtils.newList(commands);
     for (int i = 0; i < commands; i++) {
-      wireNodes[i] = deserializeNode(buf, i, protocolVersion);
+      wireNodes.add(deserializeNode(buf, i, protocolVersion));
     }
 
     // Iterate over the deserialized nodes and attempt to form a graph. We also resolve any cycles
     // that exist.
-    Queue<WireNode> nodeQueue = new ArrayDeque<>(Arrays.asList(wireNodes));
+    Queue<WireNode> nodeQueue = new ArrayDeque<>(wireNodes);
     while (!nodeQueue.isEmpty()) {
       boolean cycling = false;
 
@@ -109,7 +111,7 @@ public class AvailableCommandsPacket implements MinecraftPacket {
     }
 
     int rootIdx = ProtocolUtils.readVarInt(buf);
-    rootNode = (RootCommandNode<CommandSource>) wireNodes[rootIdx].built;
+    rootNode = (RootCommandNode<CommandSource>) wireNodes.get(rootIdx).built;
   }
 
   @Override
@@ -145,6 +147,9 @@ public class AvailableCommandsPacket implements MinecraftPacket {
     }
     if (node.getCommand() != null) {
       flags |= FLAG_EXECUTABLE;
+    }
+    if (node.getRequirement() == PLACEHOLDER_REQUIREMENT) {
+      flags |= FLAG_IS_RESTRICTED;
     }
 
     if (node instanceof LiteralCommandNode<?>) {
@@ -240,17 +245,17 @@ public class AvailableCommandsPacket implements MinecraftPacket {
       this.validated = false;
     }
 
-    void validate(WireNode[] wireNodes) {
+    void validate(List<WireNode> wireNodes) {
       // Ensure all children exist. Note that we delay checking if the node has been built yet;
       // that needs to come after this node is built.
       for (int child : children) {
-        if (child < 0 || child >= wireNodes.length) {
+        if (child < 0 || child >= wireNodes.size()) {
           throw new IllegalStateException("Node points to non-existent index " + child);
         }
       }
 
       if (redirectTo != -1) {
-        if (redirectTo < 0 || redirectTo >= wireNodes.length) {
+        if (redirectTo < 0 || redirectTo >= wireNodes.size()) {
           throw new IllegalStateException("Redirect node points to non-existent index "
               + redirectTo);
         }
@@ -259,7 +264,7 @@ public class AvailableCommandsPacket implements MinecraftPacket {
       this.validated = true;
     }
 
-    boolean toNode(WireNode[] wireNodes) {
+    boolean toNode(List<WireNode> wireNodes) {
       if (!this.validated) {
         this.validate(wireNodes);
       }
@@ -275,7 +280,7 @@ public class AvailableCommandsPacket implements MinecraftPacket {
 
           // Add any redirects
           if (redirectTo != -1) {
-            WireNode redirect = wireNodes[redirectTo];
+            WireNode redirect = wireNodes.get(redirectTo);
             if (redirect.built != null) {
               args.redirect(redirect.built);
             } else {
@@ -289,12 +294,17 @@ public class AvailableCommandsPacket implements MinecraftPacket {
             args.executes(PLACEHOLDER_COMMAND);
           }
 
+          // If restricted, add empty requirement
+          if ((flags & FLAG_IS_RESTRICTED) != 0) {
+            args.requires(PLACEHOLDER_REQUIREMENT);
+          }
+
           this.built = args.build();
         }
       }
 
       for (int child : children) {
-        if (wireNodes[child].built == null) {
+        if (wireNodes.get(child).built == null) {
           // The child is not yet deserialized. The node can't be built now.
           return false;
         }
@@ -302,7 +312,7 @@ public class AvailableCommandsPacket implements MinecraftPacket {
 
       // Associate children with nodes
       for (int child : children) {
-        CommandNode<CommandSource> childNode = wireNodes[child].built;
+        CommandNode<CommandSource> childNode = wireNodes.get(child).built;
         if (!(childNode instanceof RootCommandNode)) {
           built.addChild(childNode);
         }
@@ -320,12 +330,10 @@ public class AvailableCommandsPacket implements MinecraftPacket {
           .add("redirectTo", redirectTo);
 
       if (args != null) {
-        if (args instanceof LiteralArgumentBuilder) {
-          helper.add("argsLabel",
-              ((LiteralArgumentBuilder<CommandSource>) args).getLiteral());
-        } else if (args instanceof RequiredArgumentBuilder) {
-          helper.add("argsName",
-              ((RequiredArgumentBuilder<CommandSource, ?>) args).getName());
+        if (args instanceof LiteralArgumentBuilder literal) {
+          helper.add("argsLabel", literal.getLiteral());
+        } else if (args instanceof RequiredArgumentBuilder required) {
+          helper.add("argsName", required.getName());
         }
       }
 
@@ -337,18 +345,20 @@ public class AvailableCommandsPacket implements MinecraftPacket {
    * A placeholder {@link SuggestionProvider} used internally to preserve the suggestion provider
    * name.
    */
-  public static class ProtocolSuggestionProvider implements SuggestionProvider<CommandSource> {
-
-    private final String name;
-
-    public ProtocolSuggestionProvider(String name) {
-      this.name = name;
-    }
+  public record ProtocolSuggestionProvider(String name) implements SuggestionProvider<CommandSource> {
 
     @Override
     public CompletableFuture<Suggestions> getSuggestions(CommandContext<CommandSource> context,
-        SuggestionsBuilder builder) throws CommandSyntaxException {
+        SuggestionsBuilder builder) {
       return builder.buildFuture();
     }
+  }
+
+  @Override
+  public int encodeSizeHint(Direction direction, ProtocolVersion version) {
+    // This is a very complex packet to encode. Paper 1.21.10 + Velocity with Spark has a size of
+    // 30,334, but this is likely on the lower side. We'll use 128KiB as a more realistically-sized
+    // amount.
+    return 128 * 1024;
   }
 }
